@@ -17,12 +17,12 @@ on:
         required: false
         default: "main"
       hold_minutes:
-        description: "Hold window in minutes (default 360 / 6h; clamped to 1..=360)"
+        description: "Hold window (minutes)"
         type: number
         required: false
         default: 360
       port:
-        description: "Daemon TCP listen port on the Tailscale IPv4"
+        description: "Listen port"
         type: number
         required: false
         default: 8741
