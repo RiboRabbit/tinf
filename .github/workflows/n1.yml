@@ -1,13 +1,13 @@
 # TINF-2501 — ephemeral private-plane MCP session (manual Tailscale login).
 # Lives in the public infra repo only. No product / org / repo names hardcoded:
-# source owner/name comes from workflow_dispatch input or a repo variable.
+# source owner/name comes from workflow_dispatch input or an optional Actions secret.
 name: n1
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: "Source owner/name to build (optional; falls back to vars.DEFAULT_SOURCE_REPO)"
+        description: "Source owner/name to build (optional)"
         type: string
         required: false
         default: ""
@@ -17,10 +17,10 @@ on:
         required: false
         default: "main"
       hold_minutes:
-        description: "Hold window in minutes (clamped to 1..=360)"
+        description: "Hold window in minutes (default 360 / 6h; clamped to 1..=360)"
         type: number
         required: false
-        default: 60
+        default: 360
       port:
         description: "Daemon TCP listen port on the Tailscale IPv4"
         type: number
@@ -41,11 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      # Secrets (names only — values never echoed):
-      #   SOURCE_FETCH_TOKEN — PAT / fine-grained token that can checkout the source repo
-      #   MCP_BEARER_TOKEN   — Bearer token the daemon and Desktop MCP client share
-      # Optional repo variable:
-      #   DEFAULT_SOURCE_REPO — owner/name used when source_repo input is empty
+      # Secrets (names only — values never echoed / masked in logs):
+      #   SOURCE_FETCH_TOKEN   — PAT / fine-grained token that can checkout the source repo
+      #   MCP_BEARER_TOKEN     — Bearer token the daemon and Desktop MCP client share
+      #   DEFAULT_SOURCE_REPO  — optional owner/name when source_repo input is empty
       SOURCE_FETCH_TOKEN: ${{ secrets.SOURCE_FETCH_TOKEN }}
       MCP_BEARER_TOKEN: ${{ secrets.MCP_BEARER_TOKEN }}
 
@@ -72,7 +71,7 @@ jobs:
         shell: bash
         env:
           INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
-          VAR_DEFAULT_SOURCE_REPO: ${{ vars.DEFAULT_SOURCE_REPO }}
+          SECRET_DEFAULT_SOURCE_REPO: ${{ secrets.DEFAULT_SOURCE_REPO }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_HOLD: ${{ inputs.hold_minutes }}
           INPUT_PORT: ${{ inputs.port }}
@@ -80,21 +79,21 @@ jobs:
           set -euo pipefail
           REPO="$(echo "${INPUT_SOURCE_REPO:-}" | xargs)"
           if [[ -z "${REPO}" ]]; then
-            REPO="$(echo "${VAR_DEFAULT_SOURCE_REPO:-}" | xargs)"
+            REPO="$(echo "${SECRET_DEFAULT_SOURCE_REPO:-}" | xargs)"
           fi
           if [[ -z "${REPO}" ]]; then
-            echo "::error::Source repo unresolved. Pass source_repo (owner/name) or set repo variable DEFAULT_SOURCE_REPO."
+            echo "::error::Source repo unresolved. Pass source_repo (owner/name) or set Actions secret DEFAULT_SOURCE_REPO."
             exit 1
           fi
           if ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "::error::source repo must look like owner/name (got: ${REPO})"
+            echo "::error::source repo must look like owner/name"
             exit 1
           fi
 
           REF="$(echo "${INPUT_REF:-main}" | xargs)"
           [[ -n "${REF}" ]] || REF="main"
 
-          HOLD="${INPUT_HOLD:-60}"
+          HOLD="${INPUT_HOLD:-360}"
           if ! [[ "${HOLD}" =~ ^[0-9]+$ ]]; then
             echo "::error::hold_minutes must be an integer (got: ${HOLD})"
             exit 1
@@ -114,6 +113,7 @@ jobs:
             echo "hold_minutes=${HOLD}"
             echo "port=${PORT}"
           } >> "${GITHUB_OUTPUT}"
+          # Secret-sourced owner/name is masked by Actions when it matches the secret value.
           echo "Resolved source=${REPO}@${REF} hold=${HOLD}m port=${PORT}"
 
       - name: Checkout source into work/
