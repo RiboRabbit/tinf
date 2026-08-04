@@ -283,11 +283,12 @@ jobs:
           }
           trap cleanup EXIT
 
-          # Explicit allowlist preset (daemon remote default). Avoid blanket "all".
+          # Private-plane full catalog (Tailscale + bearer). Public Cloud Run
+          # edge stays autonomy-edge — never use "all" there.
           "${DAEMON_BIN}" \
             --listen "${LISTEN}" \
             --token-file "${TOKEN_FILE}" \
-            --allow-tools autonomy \
+            --allow-tools all \
             >"${LOG_FILE}" 2>&1 &
           echo $! > "${PID_FILE}"
 
@@ -312,7 +313,7 @@ jobs:
           fi
           echo "health ok: $(cat /tmp/n1-health.json)"
 
-          # Authenticated tools list — must be non-empty and include expected read tools.
+          # Authenticated tools list — full catalog under --allow-tools all.
           TOOLS_JSON="$(curl -fsS --max-time 10 \
             -H "Authorization: Bearer ${MCP_BEARER_TOKEN}" \
             "${BASE_URL}/mcp/tools")"
@@ -325,14 +326,20 @@ jobs:
           if not names:
               print("tools/list empty", file=sys.stderr)
               sys.exit(1)
-          # Expected read tools for the private autonomy allowlist (present on
-          # any daemon that implements the remote analysis surface).
-          required = {"query_ast_node", "run_sast_scan"}
+          # Full private-plane catalog markers (read + mutators).
+          required = {
+              "query_ast_node",
+              "run_sast_scan",
+              "pack_context",
+              "execute_ast_surgery",
+              "attach_bpftime_probes",
+              "run_closed_loop",
+          }
           missing = sorted(required - names)
           if missing:
-              print(f"missing expected read tools: {missing}; have={sorted(names)}", file=sys.stderr)
+              print(f"missing expected tools: {missing}; have={sorted(names)}", file=sys.stderr)
               sys.exit(1)
-          print(f"tools ok count={len(names)} sample={sorted(names)[:8]}")
+          print(f"tools ok count={len(names)} sample={sorted(names)[:12]}")
           PY
 
           {
