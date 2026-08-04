@@ -1,0 +1,373 @@
+# TINF-2501 — ephemeral private-plane MCP session (manual Tailscale login).
+# Lives in the public infra repo only. No product / org / repo names hardcoded:
+# source owner/name comes from workflow_dispatch input or a repo variable.
+name: n1
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source owner/name to build (optional; falls back to vars.DEFAULT_SOURCE_REPO)"
+        type: string
+        required: false
+        default: ""
+      ref:
+        description: "Git ref of the source repo"
+        type: string
+        required: false
+        default: "main"
+      hold_minutes:
+        description: "Hold window in minutes (clamped to 1..=360)"
+        type: number
+        required: false
+        default: 60
+      port:
+        description: "Daemon TCP listen port on the Tailscale IPv4"
+        type: number
+        required: false
+        default: 8741
+
+# Single-flight: only one n1 session at a time; a new dispatch cancels the prior.
+concurrency:
+  group: n1-ephemeral-session
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  session:
+    name: Build + Tailscale MCP hold
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # Secrets (names only — values never echoed):
+      #   SOURCE_FETCH_TOKEN — PAT / fine-grained token that can checkout the source repo
+      #   MCP_BEARER_TOKEN   — Bearer token the daemon and Desktop MCP client share
+      # Optional repo variable:
+      #   DEFAULT_SOURCE_REPO — owner/name used when source_repo input is empty
+      SOURCE_FETCH_TOKEN: ${{ secrets.SOURCE_FETCH_TOKEN }}
+      MCP_BEARER_TOKEN: ${{ secrets.MCP_BEARER_TOKEN }}
+
+    steps:
+      - name: Fail fast on missing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ -z "${SOURCE_FETCH_TOKEN}" ]]; then
+            echo "::error::Secret SOURCE_FETCH_TOKEN is required (checkout/fetch token for the source repo)"
+            missing=1
+          fi
+          if [[ -z "${MCP_BEARER_TOKEN}" ]]; then
+            echo "::error::Secret MCP_BEARER_TOKEN is required (MCP Bearer for the daemon + Desktop client)"
+            missing=1
+          fi
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Resolve source repo + clamp hold
+        id: resolve
+        shell: bash
+        env:
+          INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
+          VAR_DEFAULT_SOURCE_REPO: ${{ vars.DEFAULT_SOURCE_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_HOLD: ${{ inputs.hold_minutes }}
+          INPUT_PORT: ${{ inputs.port }}
+        run: |
+          set -euo pipefail
+          REPO="$(echo "${INPUT_SOURCE_REPO:-}" | xargs)"
+          if [[ -z "${REPO}" ]]; then
+            REPO="$(echo "${VAR_DEFAULT_SOURCE_REPO:-}" | xargs)"
+          fi
+          if [[ -z "${REPO}" ]]; then
+            echo "::error::Source repo unresolved. Pass source_repo (owner/name) or set repo variable DEFAULT_SOURCE_REPO."
+            exit 1
+          fi
+          if ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::source repo must look like owner/name (got: ${REPO})"
+            exit 1
+          fi
+
+          REF="$(echo "${INPUT_REF:-main}" | xargs)"
+          [[ -n "${REF}" ]] || REF="main"
+
+          HOLD="${INPUT_HOLD:-60}"
+          if ! [[ "${HOLD}" =~ ^[0-9]+$ ]]; then
+            echo "::error::hold_minutes must be an integer (got: ${HOLD})"
+            exit 1
+          fi
+          if [[ "${HOLD}" -lt 1 ]]; then HOLD=1; fi
+          if [[ "${HOLD}" -gt 360 ]]; then HOLD=360; fi
+
+          PORT="${INPUT_PORT:-8741}"
+          if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1 ]] || [[ "${PORT}" -gt 65535 ]]; then
+            echo "::error::port must be an integer 1..65535 (got: ${PORT})"
+            exit 1
+          fi
+
+          {
+            echo "source_repo=${REPO}"
+            echo "ref=${REF}"
+            echo "hold_minutes=${HOLD}"
+            echo "port=${PORT}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Resolved source=${REPO}@${REF} hold=${HOLD}m port=${PORT}"
+
+      - name: Checkout source into work/
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.resolve.outputs.source_repo }}
+          ref: ${{ steps.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_FETCH_TOKEN }}
+          path: work
+
+      - name: Discover workspace daemon package + bin
+        id: daemon
+        working-directory: work
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer a workspace package whose name ends in -daemon, then its
+          # primary bin (src/main.rs). Never hardcode product package names.
+          cargo metadata --no-deps --format-version 1 > "${RUNNER_TEMP}/cargo-metadata.json"
+          mapfile -t DISCOVERED < <(
+            python3 - "${RUNNER_TEMP}/cargo-metadata.json" <<'PY'
+          import json, sys
+          meta = json.load(open(sys.argv[1], encoding="utf-8"))
+          members = set(meta["workspace_members"])
+          for pkg in meta["packages"]:
+              if pkg["id"] not in members:
+                  continue
+              if not pkg["name"].endswith("-daemon"):
+                  continue
+              bins = [t for t in pkg["targets"] if "bin" in t.get("kind", [])]
+              if not bins:
+                  continue
+              main = [
+                  t for t in bins
+                  if t.get("src_path", "").replace("\\", "/").endswith("/main.rs")
+              ]
+              chosen = (main or bins)[0]
+              print(pkg["name"])
+              print(chosen["name"])
+              break
+          else:
+              sys.stderr.write("no workspace package ending in -daemon with a bin target\n")
+              sys.exit(1)
+          PY
+          )
+          PKG="${DISCOVERED[0]}"
+          BIN="${DISCOVERED[1]}"
+          {
+            echo "package=${PKG}"
+            echo "bin=${BIN}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Daemon package=${PKG} bin=${BIN}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          shared-key: n1-daemon-release
+
+      - name: cargo build --release (daemon) + smoke --help
+        working-directory: work
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.daemon.outputs.package }}"
+          BIN="${{ steps.daemon.outputs.bin }}"
+          cargo build --release -p "${PKG}" --bin "${BIN}"
+          "./target/release/${BIN}" --help >/dev/null
+          test -x "./target/release/${BIN}"
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo mkdir -p /var/run/tailscale /var/lib/tailscale /dev/net
+          # Inbound listen on the Tailscale IPv4 needs a real TUN device.
+          # GitHub-hosted runners usually allow creating /dev/net/tun.
+          if [[ ! -c /dev/net/tun ]]; then
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
+          if [[ ! -c /dev/net/tun ]]; then
+            echo "::error::/dev/net/tun unavailable; cannot publish an inbound MCP listener on Tailscale IPv4"
+            exit 1
+          fi
+          sudo tailscaled \
+            --state=/var/lib/tailscale/tailscaled.state \
+            --socket=/var/run/tailscale/tailscaled.sock \
+            >/tmp/tailscaled.log 2>&1 &
+          echo $! | sudo tee /tmp/tailscaled.pid >/dev/null
+          for i in $(seq 1 30); do
+            if sudo tailscale --socket=/var/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          echo "tailscaled started; log=/tmp/tailscaled.log"
+
+      - name: Tailscale up (manual login — watch the auth URL in the log)
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOSTNAME="n1-${GITHUB_RUN_ID}"
+          echo "================================================================"
+          echo "Manual Tailscale login required."
+          echo "When the auth URL appears below, open it in a browser and approve."
+          echo "This step blocks until login completes (or the job times out)."
+          echo "================================================================"
+          # --timeout 0 waits indefinitely for interactive auth (job still
+          # bounded by timeout-minutes: 360).
+          sudo tailscale --socket=/var/run/tailscale/tailscaled.sock up \
+            --hostname="${HOSTNAME}" \
+            --accept-dns=false \
+            --timeout=0
+          TS_IP="$(sudo tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 | head -n1)"
+          if [[ -z "${TS_IP}" ]]; then
+            echo "::error::Tailscale IPv4 missing after successful up"
+            exit 1
+          fi
+          echo "TS_IP=${TS_IP}" >> "${GITHUB_ENV}"
+          echo "Tailscale IPv4=${TS_IP}"
+
+      - name: Start daemon on Tailscale IP + health/tools assert
+        id: mcp
+        working-directory: work
+        shell: bash
+        env:
+          PORT: ${{ steps.resolve.outputs.port }}
+          HOLD_MINUTES: ${{ steps.resolve.outputs.hold_minutes }}
+          BIN: ${{ steps.daemon.outputs.bin }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TS_IP:-}" ]]; then
+            echo "::error::TS_IP not set"
+            exit 1
+          fi
+
+          ARTIFACT_DIR="${RUNNER_TEMP}/n1-session"
+          mkdir -p "${ARTIFACT_DIR}"
+          TOKEN_FILE="${ARTIFACT_DIR}/mcp.bearer"
+          PID_FILE="${ARTIFACT_DIR}/daemon.pid"
+          LOG_FILE="${ARTIFACT_DIR}/daemon.log"
+          umask 077
+          printf '%s' "${MCP_BEARER_TOKEN}" > "${TOKEN_FILE}"
+          chmod 0600 "${TOKEN_FILE}"
+
+          DAEMON_BIN="$(pwd)/target/release/${BIN}"
+          LISTEN="${TS_IP}:${PORT}"
+          BASE_URL="http://${LISTEN}"
+
+          cleanup() {
+            local exit_code=$?
+            if [[ -f "${PID_FILE}" ]]; then
+              local pid
+              pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+              if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+                kill "${pid}" 2>/dev/null || true
+                wait "${pid}" 2>/dev/null || true
+              fi
+            fi
+            rm -f "${TOKEN_FILE}" "${PID_FILE}"
+            return "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          # Explicit allowlist preset (daemon remote default). Avoid blanket "all".
+          "${DAEMON_BIN}" \
+            --listen "${LISTEN}" \
+            --token-file "${TOKEN_FILE}" \
+            --allow-tools autonomy \
+            >"${LOG_FILE}" 2>&1 &
+          echo $! > "${PID_FILE}"
+
+          # Health-check loop
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${BASE_URL}/health" >/tmp/n1-health.json 2>/dev/null; then
+              ok=1
+              break
+            fi
+            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+              echo "::error::daemon exited during boot; log:"
+              tail -n 200 "${LOG_FILE}" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "${ok}" -ne 1 ]]; then
+            echo "::error::/health never became ready; log:"
+            tail -n 200 "${LOG_FILE}" || true
+            exit 1
+          fi
+          echo "health ok: $(cat /tmp/n1-health.json)"
+
+          # Authenticated tools list — must be non-empty and include expected read tools.
+          TOOLS_JSON="$(curl -fsS --max-time 10 \
+            -H "Authorization: Bearer ${MCP_BEARER_TOKEN}" \
+            "${BASE_URL}/mcp/tools")"
+          printf '%s\n' "${TOOLS_JSON}" > /tmp/n1-tools.json
+          python3 - <<'PY'
+          import json, sys
+          data = json.loads(open("/tmp/n1-tools.json", encoding="utf-8").read())
+          tools = data.get("tools") or data.get("result", {}).get("tools") or []
+          names = {t.get("name") for t in tools if isinstance(t, dict)}
+          if not names:
+              print("tools/list empty", file=sys.stderr)
+              sys.exit(1)
+          # Expected read tools for the private autonomy allowlist (present on
+          # any daemon that implements the remote analysis surface).
+          required = {"query_ast_node", "run_sast_scan"}
+          missing = sorted(required - names)
+          if missing:
+              print(f"missing expected read tools: {missing}; have={sorted(names)}", file=sys.stderr)
+              sys.exit(1)
+          print(f"tools ok count={len(names)} sample={sorted(names)[:8]}")
+          PY
+
+          {
+            echo "base_url=${BASE_URL}"
+            echo "token_file=${TOKEN_FILE}"
+            echo "pid_file=${PID_FILE}"
+            echo "log_file=${LOG_FILE}"
+            echo "artifact_dir=${ARTIFACT_DIR}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "================================================================"
+          echo "MCP base URL (Desktop over Tailscale): ${BASE_URL}"
+          echo "Auth: Authorization: Bearer <MCP_BEARER_TOKEN secret value>"
+          echo "Health: ${BASE_URL}/health"
+          echo "Tools:  ${BASE_URL}/mcp/tools"
+          echo "Hold:   ${HOLD_MINUTES} minute(s)"
+          echo "================================================================"
+          echo "MCP_BASE_URL=${BASE_URL}" >> "${GITHUB_ENV}"
+
+          # Hold with periodic /health until minutes elapse; trap always cleans up.
+          END_AT=$((SECONDS + HOLD_MINUTES * 60))
+          echo "Holding until epoch-offset ${END_AT} (hold_minutes=${HOLD_MINUTES})"
+          while (( SECONDS < END_AT )); do
+            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+              echo "::error::daemon died during hold; log:"
+              tail -n 200 "${LOG_FILE}" || true
+              exit 1
+            fi
+            if ! curl -fsS --max-time 5 "${BASE_URL}/health" >/dev/null; then
+              echo "::warning::periodic /health failed at SECONDS=${SECONDS}"
+            else
+              remaining=$(( END_AT - SECONDS ))
+              echo "health ok; ~${remaining}s remaining"
+            fi
+            # Sleep in chunks so job cancellation / trap still runs promptly.
+            sleep 30
+          done
+          echo "Hold complete; cleaning up daemon + token file"
