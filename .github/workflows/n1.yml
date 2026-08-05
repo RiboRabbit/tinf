@@ -1,7 +1,7 @@
-# TINF-2501 + TINF-3101 — ephemeral private-plane MCP session (manual Tailscale
-# login) with live bpftime host bootstrap. Lives in the public infra repo only.
-# No product / org / repo names hardcoded: source owner/name comes from
-# workflow_dispatch input or an optional Actions secret.
+# TINF-2501 + TINF-3101 + TINF-3102 — ephemeral private-plane MCP session
+# (manual Tailscale login) with live bpftime host bootstrap + daemon PATH.
+# Lives in the public infra repo only. No product / org / repo names hardcoded:
+# source owner/name comes from workflow_dispatch input or an optional Actions secret.
 name: n1
 
 on:
@@ -338,6 +338,57 @@ jobs:
           echo "TS_IP=${TS_IP}" >> "${GITHUB_ENV}"
           echo "Tailscale IPv4=${TS_IP}"
 
+      - name: Wire bpftime PATH + boot smoke (TINF-3102)
+        working-directory: work
+        shell: bash
+        env:
+          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
+        run: |
+          set -euo pipefail
+          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
+          if [[ ! -x "${HOME_BPFTIME}/bpftime" ]]; then
+            echo "::error::bpftime CLI missing at ${HOME_BPFTIME}/bpftime (TINF-3101 bootstrap required)"
+            exit 1
+          fi
+          if [[ ! -f "${HOME_BPFTIME}/libbpftime-agent.so" \
+             && ! -f "${HOME_BPFTIME}/libbpftime-agent.dylib" ]]; then
+            echo "::error::libbpftime-agent missing under ${HOME_BPFTIME}"
+            exit 1
+          fi
+
+          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
+          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
+
+          # Persist for subsequent steps (daemon must inherit locate_bpftime).
+          # Prefer GITHUB_PATH for PATH prepend (do not write PATH= into GITHUB_ENV).
+          echo "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_ENV}"
+          echo "${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_PATH}"
+
+          if ! command -v bpftime >/dev/null 2>&1; then
+            echo "::error::bpftime not on PATH after prepending ${SYMBOTREE_BPFTIME_HOME}"
+            exit 1
+          fi
+          BPFTIME_BIN="$(command -v bpftime)"
+          echo "bpftime on PATH: ${BPFTIME_BIN}"
+
+          "${BPFTIME_BIN}" --help >/tmp/n1-bpftime-boot-help.txt 2>&1 \
+            || "${BPFTIME_BIN}" -h >/tmp/n1-bpftime-boot-help.txt 2>&1 \
+            || "${BPFTIME_BIN}" >/tmp/n1-bpftime-boot-help.txt 2>&1 \
+            || true
+          if ! grep -Eiq 'attach|load|usage|bpftime' /tmp/n1-bpftime-boot-help.txt; then
+            echo "::error::bpftime --help boot smoke failed (attach/load missing)"
+            cat /tmp/n1-bpftime-boot-help.txt || true
+            exit 1
+          fi
+          echo "bpftime --help boot smoke ok"
+
+          # Optional SETUP-004 verify (CLI required; live attach best-effort).
+          if [[ -x scripts/verify_bpftime_env.sh ]]; then
+            # Non-strict: do not fail the session on rootless attach limits.
+            SYMBOTREE_BPFTIME_STRICT=0 bash scripts/verify_bpftime_env.sh \
+              || echo "::warning::verify_bpftime_env.sh reported issues (non-fatal)"
+          fi
+
       - name: Start daemon on Tailscale IP + health/tools assert
         id: mcp
         working-directory: work
@@ -346,10 +397,20 @@ jobs:
           PORT: ${{ steps.resolve.outputs.port }}
           HOLD_MINUTES: ${{ steps.resolve.outputs.hold_minutes }}
           BIN: ${{ steps.daemon.outputs.bin }}
+          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
         run: |
           set -euo pipefail
           if [[ -z "${TS_IP:-}" ]]; then
             echo "::error::TS_IP not set"
+            exit 1
+          fi
+
+          # TINF-3102: daemon child must see bpftime for ProbeManager.live=true.
+          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
+          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
+          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
+          if ! command -v bpftime >/dev/null 2>&1; then
+            echo "::error::bpftime not on PATH at daemon start"
             exit 1
           fi
 
@@ -383,7 +444,11 @@ jobs:
 
           # Private-plane full catalog (Tailscale + bearer). Public Cloud Run
           # edge stays autonomy-edge — never use "all" there.
-          "${DAEMON_BIN}" \
+          # Env (PATH + SYMBOTREE_BPFTIME_HOME) inherited by the daemon process.
+          env \
+            "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" \
+            "PATH=${PATH}" \
+            "${DAEMON_BIN}" \
             --listen "${LISTEN}" \
             --token-file "${TOKEN_FILE}" \
             --allow-tools all \
@@ -410,6 +475,7 @@ jobs:
             exit 1
           fi
           echo "health ok: $(cat /tmp/n1-health.json)"
+          echo "bpftime_env daemon SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME} bpftime=$(command -v bpftime)"
 
           # Authenticated tools list — full catalog under --allow-tools all.
           TOOLS_JSON="$(curl -fsS --max-time 10 \
