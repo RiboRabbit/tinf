@@ -1,6 +1,7 @@
-# TINF-2501 — ephemeral private-plane MCP session (manual Tailscale login).
-# Lives in the public infra repo only. No product / org / repo names hardcoded:
-# source owner/name comes from workflow_dispatch input or an optional Actions secret.
+# TINF-2501 + TINF-3101 — ephemeral private-plane MCP session (manual Tailscale
+# login) with live bpftime host bootstrap. Lives in the public infra repo only.
+# No product / org / repo names hardcoded: source owner/name comes from
+# workflow_dispatch input or an optional Actions secret.
 name: n1
 
 on:
@@ -47,6 +48,10 @@ jobs:
       #   DEFAULT_SOURCE_REPO  — optional owner/name when source_repo input is empty
       SOURCE_FETCH_TOKEN: ${{ secrets.SOURCE_FETCH_TOKEN }}
       MCP_BEARER_TOKEN: ${{ secrets.MCP_BEARER_TOKEN }}
+      # TINF-3101: SETUP-004 install prefix (ProbeManager / locate_bpftime).
+      SYMBOTREE_BPFTIME_HOME: /home/runner/.bpftime
+      # Pin matches scripts/bootstrap_bpftime.sh default.
+      SYMBOTREE_BPFTIME_REF: v0.2.0
 
     steps:
       - name: Fail fast on missing secrets
@@ -123,6 +128,99 @@ jobs:
           ref: ${{ steps.resolve.outputs.ref }}
           token: ${{ secrets.SOURCE_FETCH_TOKEN }}
           path: work
+          # TINF-3101: pull third_party/bpftime (public) for SETUP-004 bootstrap.
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Resolve bpftime cache key
+        id: bpftime_key
+        working-directory: work
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer the recorded submodule SHA; fall back to pinned ref string.
+          KEY=""
+          if [[ -f .gitmodules ]] && grep -Fq 'third_party/bpftime' .gitmodules; then
+            KEY="$(git rev-parse HEAD:third_party/bpftime 2>/dev/null || true)"
+          fi
+          if [[ -z "${KEY}" ]]; then
+            KEY="${SYMBOTREE_BPFTIME_REF:-v0.2.0}"
+          fi
+          {
+            echo "key=${KEY}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "bpftime cache key=${KEY}"
+
+      - name: Install bpftime build deps (TINF-3101)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            binutils-dev \
+            ca-certificates \
+            clang \
+            cmake \
+            g++ \
+            git \
+            libboost-all-dev \
+            libbpf-dev \
+            libclang-dev \
+            libelf-dev \
+            libssl-dev \
+            llvm \
+            llvm-dev \
+            ninja-build \
+            pkg-config \
+            zlib1g-dev
+          cmake --version
+          clang --version | head -n1
+
+      - name: Cache bpftime CLI/agent + cmake build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.SYMBOTREE_BPFTIME_HOME }}
+            work/third_party/bpftime/build
+          key: n1-bpftime-${{ runner.os }}-${{ steps.bpftime_key.outputs.key }}
+          restore-keys: |
+            n1-bpftime-${{ runner.os }}-
+
+      - name: Bootstrap bpftime (SETUP-004 / TINF-3101)
+        working-directory: work
+        shell: bash
+        env:
+          SYMBOTREE_BPFTIME_STRICT: "1"
+          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
+          SYMBOTREE_BPFTIME_REF: ${{ env.SYMBOTREE_BPFTIME_REF }}
+        run: |
+          set -euo pipefail
+          if [[ ! -x scripts/bootstrap_bpftime.sh ]]; then
+            echo "::error::scripts/bootstrap_bpftime.sh missing in source checkout"
+            exit 1
+          fi
+          # Ensure submodule / clone exists even if checkout skipped nested bits.
+          if [[ -f .gitmodules ]] && grep -Fq 'third_party/bpftime' .gitmodules; then
+            git submodule update --init --depth 1 third_party/bpftime \
+              || git submodule update --init third_party/bpftime \
+              || true
+          fi
+          bash scripts/bootstrap_bpftime.sh
+          test -x "${SYMBOTREE_BPFTIME_HOME}/bpftime"
+          test -f "${SYMBOTREE_BPFTIME_HOME}/libbpftime-agent.so" \
+            || test -f "${SYMBOTREE_BPFTIME_HOME}/libbpftime-agent.dylib"
+          "${SYMBOTREE_BPFTIME_HOME}/bpftime" --help >/tmp/n1-bpftime-help.txt 2>&1 \
+            || "${SYMBOTREE_BPFTIME_HOME}/bpftime" -h >/tmp/n1-bpftime-help.txt 2>&1 \
+            || "${SYMBOTREE_BPFTIME_HOME}/bpftime" >/tmp/n1-bpftime-help.txt 2>&1 \
+            || true
+          if ! grep -Eiq 'attach|load|usage|bpftime' /tmp/n1-bpftime-help.txt; then
+            echo "::error::bpftime help missing attach/load after bootstrap"
+            cat /tmp/n1-bpftime-help.txt || true
+            exit 1
+          fi
+          echo "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_ENV}"
+          echo "bpftime ready at ${SYMBOTREE_BPFTIME_HOME}/bpftime"
 
       - name: Discover workspace daemon package + bin
         id: daemon
