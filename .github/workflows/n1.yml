@@ -1,7 +1,8 @@
-# TINF-2501 + TINF-3101 + TINF-3102 — ephemeral private-plane MCP session
-# (manual Tailscale login) with live bpftime host bootstrap + daemon PATH.
-# Lives in the public infra repo only. No product / org / repo names hardcoded:
-# source owner/name comes from workflow_dispatch input or an optional Actions secret.
+# TINF-2501 + TINF-3101 + TINF-3102 + TINF-3103 — ephemeral private-plane MCP
+# session (manual Tailscale login) with live bpftime bootstrap, daemon PATH,
+# and pre-Tailscale MCP live-probe attestation. Lives in the public infra repo
+# only. No product / org / repo names hardcoded: source owner/name comes from
+# workflow_dispatch input or an optional Actions secret.
 name: n1
 
 on:
@@ -284,6 +285,248 @@ jobs:
           cargo build --release -p "${PKG}" --bin "${BIN}"
           "./target/release/${BIN}" --help >/dev/null
           test -x "./target/release/${BIN}"
+
+      - name: MCP live probe attestation (TINF-3103)
+        id: livebpf
+        working-directory: work
+        shell: bash
+        env:
+          BIN: ${{ steps.daemon.outputs.bin }}
+          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
+          EVIDENCE_PATH: ${{ runner.temp }}/tinf-3103-tinf-evidence.json
+        run: |
+          set -euo pipefail
+          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
+          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
+          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
+          if [[ ! -x "${SYMBOTREE_BPFTIME_HOME}/bpftime" ]]; then
+            echo "::error::bpftime CLI missing — cannot attest live plane"
+            exit 1
+          fi
+          if ! command -v bpftime >/dev/null 2>&1; then
+            echo "::error::bpftime not on PATH for attestation"
+            exit 1
+          fi
+
+          DAEMON_BIN="$(pwd)/target/release/${BIN}"
+          ARTIFACT_DIR="${RUNNER_TEMP}/n1-livebpf"
+          mkdir -p "${ARTIFACT_DIR}"
+          TOKEN_FILE="${ARTIFACT_DIR}/attest.bearer"
+          PID_FILE="${ARTIFACT_DIR}/attest.pid"
+          LOG_FILE="${ARTIFACT_DIR}/attest.log"
+          EVIDENCE="${EVIDENCE_PATH}"
+          umask 077
+          # Ephemeral local-only token (not the Desktop bearer); never written to evidence.
+          ATTEST_TOKEN="$(openssl rand -hex 24)"
+          printf '%s' "${ATTEST_TOKEN}" > "${TOKEN_FILE}"
+          chmod 0600 "${TOKEN_FILE}"
+
+          LISTEN="127.0.0.1:18741"
+          BASE_URL="http://${LISTEN}"
+
+          cleanup() {
+            local exit_code=$?
+            if [[ -f "${PID_FILE}" ]]; then
+              local pid
+              pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+              if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+                kill "${pid}" 2>/dev/null || true
+                wait "${pid}" 2>/dev/null || true
+              fi
+            fi
+            rm -f "${TOKEN_FILE}" "${PID_FILE}"
+            return "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          env \
+            "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" \
+            "PATH=${PATH}" \
+            "${DAEMON_BIN}" \
+            --listen "${LISTEN}" \
+            --token-file "${TOKEN_FILE}" \
+            --allow-tools all \
+            >"${LOG_FILE}" 2>&1 &
+          echo $! > "${PID_FILE}"
+
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${BASE_URL}/health" >/tmp/n1-attest-health.json 2>/dev/null; then
+              ok=1
+              break
+            fi
+            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+              echo "::error::attest daemon exited; log:"
+              tail -n 200 "${LOG_FILE}" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "${ok}" -ne 1 ]]; then
+            echo "::error::attest /health never ready; log:"
+            tail -n 200 "${LOG_FILE}" || true
+            exit 1
+          fi
+
+          rpc_call() {
+            local method="$1"
+            local params="$2"
+            local out="$3"
+            curl -fsS --max-time 60 \
+              -H "Authorization: Bearer ${ATTEST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
+              "${BASE_URL}/rpc" > "${out}"
+          }
+
+          rpc_call list_probe_targets \
+            '{"path":"samples/bpftime/victim.c","include_session":true}' \
+            /tmp/n1-attest-targets.json
+
+          make -C samples/bpftime victim >/tmp/n1-attest-victim-build.log 2>&1 || true
+          if [[ -x samples/bpftime/victim ]]; then
+            if ! rpc_call attach_bpftime_probes \
+              '{"binary":"samples/bpftime/victim","path":"samples/bpftime/victim.c"}' \
+              /tmp/n1-attest-attach.json; then
+              echo "::warning::attach_bpftime_probes RPC failed (rootless limits may apply)"
+              echo '{"ok":false,"note":"attach RPC failed"}' > /tmp/n1-attest-attach.json
+            fi
+          else
+            echo '{"ok":false,"note":"victim binary missing"}' > /tmp/n1-attest-attach.json
+          fi
+
+          rpc_call list_telemetry_events '{"drain":false}' /tmp/n1-attest-telemetry.json \
+            || echo '{"ok":false}' > /tmp/n1-attest-telemetry.json
+
+          python3 - <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          def load(path):
+              try:
+                  return json.load(open(path, encoding="utf-8"))
+              except Exception as exc:
+                  return {"_load_error": str(exc)}
+
+          def unwrap(rpc):
+              if not isinstance(rpc, dict):
+                  return {}
+              if "result" in rpc:
+                  return rpc["result"]
+              if "error" in rpc:
+                  return {"ok": False, "rpc_error": rpc["error"]}
+              return rpc
+
+          targets = unwrap(load("/tmp/n1-attest-targets.json"))
+          attach = unwrap(load("/tmp/n1-attest-attach.json"))
+          telem = unwrap(load("/tmp/n1-attest-telemetry.json"))
+
+          live = targets.get("live")
+          bpftime_available = targets.get("bpftime_available")
+          unavailable = targets.get("unavailable")
+          backend = targets.get("backend")
+          session = targets.get("session") or {}
+          if live is None:
+              live = session.get("live")
+          if bpftime_available is None:
+              bpftime_available = session.get("bpftime_available")
+          if unavailable is None and live is not None:
+              unavailable = not live
+          if backend is None:
+              backend = session.get("backend")
+
+          ok = (
+              targets.get("ok") is True
+              and bpftime_available is True
+              and live is True
+              and unavailable is False
+          )
+          evidence = {
+              "ticket": "TINF-3103",
+              "plane": "tinf",
+              "mcp_server": "symbotree-private-plane",
+              "ok": ok,
+              "attested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "attestation": {
+                  "mode": "pre_tailscale_localhost_mcp",
+                  "listen": "127.0.0.1:18741",
+                  "notes": [
+                      "Measured on tinf GHA runner after SETUP-004 bootstrap + daemon PATH wiring",
+                      "Localhost MCP attest before Tailscale hold (no Desktop tokens / TS IPs)",
+                      "Inverse of MCPOPS-3004 unavailable contract",
+                  ],
+              },
+              "tinf_measured": {
+                  "list_probe_targets": {
+                      "ok": targets.get("ok"),
+                      "live": live,
+                      "unavailable": unavailable,
+                      "bpftime_available": bpftime_available,
+                      "backend": backend,
+                      "detail": targets.get("detail"),
+                      "target_count": targets.get("target_count"),
+                      "session": {
+                          "bpftime_available": session.get("bpftime_available"),
+                          "backend": session.get("backend"),
+                          "attachment_count": session.get("attachment_count"),
+                          "ip_map_size": session.get("ip_map_size"),
+                          "live": session.get("live"),
+                          "unavailable": session.get("unavailable"),
+                      },
+                  },
+                  "attach_bpftime_probes": {
+                      "attempted": os.path.exists("samples/bpftime/victim"),
+                      "ok": attach.get("ok"),
+                      "live": attach.get("live"),
+                      "bpftime_available": attach.get("bpftime_available"),
+                      "backend": attach.get("backend"),
+                      "note": attach.get("note"),
+                  },
+                  "list_telemetry_events": {
+                      "ok": telem.get("ok"),
+                      "live": telem.get("live"),
+                      "bpftime_available": telem.get("bpftime_available"),
+                      "drained": telem.get("drained"),
+                  },
+              },
+              "contract": {
+                  "when_bpftime_available_true": {
+                      "live": True,
+                      "unavailable": False,
+                      "bpftime_available": True,
+                      "detail_contains": "live",
+                  },
+                  "source": [
+                      "docs/project-files/09-tinf/n1.yml",
+                      "crates/symbotree-daemon/src/platform.rs",
+                      "crates/symbotree-instrument/src/session.rs",
+                  ],
+              },
+          }
+          out = os.environ["EVIDENCE_PATH"]
+          json.dump(evidence, open(out, "w", encoding="utf-8"), indent=2)
+          print(json.dumps({
+              "ok": ok,
+              "live": live,
+              "bpftime_available": bpftime_available,
+              "backend": backend,
+              "attach_ok": attach.get("ok"),
+          }))
+          if not ok:
+              print("LIVE ATTEST FAILED", file=sys.stderr)
+              print(json.dumps(targets, indent=2)[:4000], file=sys.stderr)
+              sys.exit(1)
+          PY
+
+          echo "evidence=${EVIDENCE}" >> "${GITHUB_OUTPUT}"
+          echo "TINF-3103 live attestation ok; evidence=${EVIDENCE}"
+
+      - name: Upload TINF-3103 evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinf-3103-tinf-evidence
+          path: ${{ runner.temp }}/tinf-3103-tinf-evidence.json
+          if-no-files-found: error
 
       - name: Install Tailscale
         shell: bash
