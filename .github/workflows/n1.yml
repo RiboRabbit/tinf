@@ -561,7 +561,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HOSTNAME="n1-${GITHUB_RUN_ID}"
+          HOSTNAME="symbotree-live"
           echo "================================================================"
           echo "Manual Tailscale login required."
           echo "When the auth URL appears below, open it in a browser and approve."
