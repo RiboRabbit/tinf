@@ -572,6 +572,7 @@ jobs:
           sudo tailscale --socket=/var/run/tailscale/tailscaled.sock up \
             --hostname="${HOSTNAME}" \
             --accept-dns=false \
+            --ssh \
             --timeout=0
           TS_IP="$(sudo tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 | head -n1)"
           if [[ -z "${TS_IP}" ]]; then
