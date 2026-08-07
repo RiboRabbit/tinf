@@ -686,11 +686,20 @@ jobs:
           }
           trap cleanup EXIT
 
+          # CLOUD-1609 Option B: same session id on daemon + Cursor stdio bridge
+          # (`scripts/cursor_remote_mcp.py`). Bare HTTP MCP has no staging path —
+          # Desktop/Cloud Agents must use the bridge when this env is set, or
+          # PathResolver will miss unstaged agent bytes (no OS fallthrough).
+          WS_SESSION="n1-${GITHUB_RUN_ID}"
+          echo "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" >> "${GITHUB_ENV}"
+          echo "workspace_session=${WS_SESSION}" >> "${GITHUB_OUTPUT}"
+
           # Private-plane full catalog (Tailscale + bearer). Public Cloud Run
           # edge stays autonomy-edge — never use "all" there.
-          # Env (PATH + SYMBOTREE_BPFTIME_HOME) inherited by the daemon process.
+          # Env (PATH + SYMBOTREE_BPFTIME_HOME + WORKSPACE_SESSION) inherited.
           env \
             "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" \
+            "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" \
             "PATH=${PATH}" \
             "${DAEMON_BIN}" \
             --listen "${LISTEN}" \
@@ -759,11 +768,19 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
           echo "================================================================"
-          echo "MCP base URL (Desktop over Tailscale): ${BASE_URL}"
+          echo "MCP base URL (use stdio bridge — CLOUD-1609 session ON): ${BASE_URL}"
           echo "Auth: Authorization: Bearer <MCP_BEARER_TOKEN secret value>"
+          echo "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}"
           echo "Health: ${BASE_URL}/health"
           echo "Tools:  ${BASE_URL}/mcp/tools"
           echo "Hold:   ${HOLD_MINUTES} minute(s)"
+          echo "----------------------------------------------------------------"
+          echo "Cursor mcp.json (stdio bridge — required for session staging):"
+          echo "  export SYMBOTREE_PRIVATE_PLANE_URL=${BASE_URL}"
+          echo "  export SYMBOTREE_RPC_TOKEN=<MCP_BEARER_TOKEN>"
+          echo "  export SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}"
+          echo "  # then use .cursor/mcp.json → symbotree-private-plane"
+          echo "Bare HTTP MCP URL config will NOT stage /workspace bytes."
           echo "================================================================"
           echo "MCP_BASE_URL=${BASE_URL}" >> "${GITHUB_ENV}"
 
