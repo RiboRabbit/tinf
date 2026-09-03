@@ -180,7 +180,7 @@ jobs:
           sudo usermod -aG sudo rdp
           echo "xfce4-session" | sudo tee /home/rdp/.xsession
           sudo chown rdp:rdp /home/rdp/.xsession
-          install -d -o rdp -g rdp /home/rdp/.config/autostart
+          sudo install -d -o rdp -g rdp /home/rdp/.config/autostart
           printf '%s\n' \
             '[Desktop Entry]' \
             'Type=Application' \
