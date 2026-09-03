@@ -1,37 +1,53 @@
-# TINF-2501 + TINF-3101 + TINF-3102 + TINF-3103 — ephemeral private-plane MCP
-# session (manual Tailscale login) with live bpftime bootstrap, daemon PATH,
-# and pre-Tailscale MCP live-probe attestation. Lives in the public infra repo
-# only. No product / org / repo names hardcoded: source owner/name comes from
-# workflow_dispatch input or an optional Actions secret.
-name: n1
+# Combined Cursor execution environment on GitHub-hosted runners.
+# Dispatch-only (never on push/PR) so it does not widen product CI billing.
+#
+# Replaces a Cursor Cloud VM: you pay GHA minutes, not Cursor VM credits.
+# Harbours the tinf + basic-test union:
+#   tinf n1.yml          — build any ref, Tailscale MCP, private-plane catalog
+#   basic-test RDP       — XFCE + xrdp on the tailnet
+#   Cursor My Machines   — `agent worker --computer-use --share-desktop`
+#                           so cursor.com/agents runs ON this runner
+#
+# Secrets (names only — never commit values):
+#   CURSOR_API_KEY       — personal user API key (My Machines worker)
+#   MCP_BEARER_TOKEN     — daemon + Desktop remote MCP
+#   TAILSCALE_AUTH_KEY   — optional; omit to use n1-style manual login
+#   RDP_PASSWORD         — optional; generated for the job if unset
+#   SOURCE_FETCH_TOKEN   — checkout token for the source owner/name
+#   DEFAULT_SOURCE_REPO  — optional owner/name when source_repo input is empty
+name: cursor-env
 
 on:
   workflow_dispatch:
     inputs:
-      source_repo:
-        description: "Source owner/name to build (optional)"
-        type: string
-        required: false
-        default: ""
       ref:
-        description: "Git ref of the source repo"
+        description: "Git ref of the source repo to build (any version)"
         type: string
         required: false
         default: "main"
+      source_repo:
+        description: "owner/name to checkout (empty = DEFAULT_SOURCE_REPO secret)"
+        type: string
+        required: false
+        default: ""
       hold_minutes:
-        description: "Hold window (minutes)"
+        description: "Hold window (minutes), 1..360"
         type: number
         required: false
         default: 360
       port:
-        description: "Listen port"
+        description: "MCP listen port on the Tailscale IP"
         type: number
         required: false
         default: 8741
+      bootstrap_bpftime:
+        description: "Also bootstrap live bpftime (slow)"
+        type: boolean
+        required: false
+        default: false
 
-# Single-flight: only one n1 session at a time; a new dispatch cancels the prior.
 concurrency:
-  group: n1-ephemeral-session
+  group: cursor-env-session
   cancel-in-progress: true
 
 permissions:
@@ -39,51 +55,31 @@ permissions:
 
 jobs:
   session:
-    name: Build + Tailscale MCP hold
+    name: Build + MCP + RDP + Cursor worker
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      # Secrets (names only — values never echoed / masked in logs):
-      #   SOURCE_FETCH_TOKEN   — PAT / fine-grained token that can checkout the source repo
-      #   MCP_BEARER_TOKEN     — Bearer token the daemon and Desktop MCP client share
-      #   DEFAULT_SOURCE_REPO  — optional owner/name when source_repo input is empty
-      SOURCE_FETCH_TOKEN: ${{ secrets.SOURCE_FETCH_TOKEN }}
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       MCP_BEARER_TOKEN: ${{ secrets.MCP_BEARER_TOKEN }}
-      # TINF-3101: SETUP-004 install prefix (ProbeManager / locate_bpftime).
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      SOURCE_FETCH_TOKEN: ${{ secrets.SOURCE_FETCH_TOKEN }}
+      DEFAULT_SOURCE_REPO: ${{ secrets.DEFAULT_SOURCE_REPO }}
       SYMBOTREE_BPFTIME_HOME: /home/runner/.bpftime
-      # Pin matches scripts/bootstrap_bpftime.sh default.
-      SYMBOTREE_BPFTIME_REF: v0.2.0
 
     steps:
-      - name: Fail fast on missing secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          missing=0
-          if [[ -z "${SOURCE_FETCH_TOKEN}" ]]; then
-            echo "::error::Secret SOURCE_FETCH_TOKEN is required (checkout/fetch token for the source repo)"
-            missing=1
-          fi
-          if [[ -z "${MCP_BEARER_TOKEN}" ]]; then
-            echo "::error::Secret MCP_BEARER_TOKEN is required (MCP Bearer for the daemon + Desktop client)"
-            missing=1
-          fi
-          if [[ "${missing}" -ne 0 ]]; then
-            exit 1
-          fi
-
-      - name: Resolve source repo + clamp hold
+      - name: Resolve inputs
         id: resolve
         shell: bash
         env:
-          INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
-          SECRET_DEFAULT_SOURCE_REPO: ${{ secrets.DEFAULT_SOURCE_REPO }}
+          INPUT_REPO: ${{ inputs.source_repo }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_HOLD: ${{ inputs.hold_minutes }}
           INPUT_PORT: ${{ inputs.port }}
+          SECRET_DEFAULT_SOURCE_REPO: ${{ secrets.DEFAULT_SOURCE_REPO }}
         run: |
           set -euo pipefail
-          REPO="$(echo "${INPUT_SOURCE_REPO:-}" | xargs)"
+          REPO="$(echo "${INPUT_REPO:-}" | xargs)"
           if [[ -z "${REPO}" ]]; then
             REPO="$(echo "${SECRET_DEFAULT_SOURCE_REPO:-}" | xargs)"
           fi
@@ -92,441 +88,134 @@ jobs:
             exit 1
           fi
           if ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "::error::source repo must look like owner/name"
+            echo "::error::source_repo must look like owner/name"
             exit 1
           fi
-
           REF="$(echo "${INPUT_REF:-main}" | xargs)"
           [[ -n "${REF}" ]] || REF="main"
-
           HOLD="${INPUT_HOLD:-360}"
           if ! [[ "${HOLD}" =~ ^[0-9]+$ ]]; then
-            echo "::error::hold_minutes must be an integer (got: ${HOLD})"
+            echo "::error::hold_minutes must be an integer"
             exit 1
           fi
           if [[ "${HOLD}" -lt 1 ]]; then HOLD=1; fi
           if [[ "${HOLD}" -gt 360 ]]; then HOLD=360; fi
-
           PORT="${INPUT_PORT:-8741}"
           if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1 ]] || [[ "${PORT}" -gt 65535 ]]; then
-            echo "::error::port must be an integer 1..65535 (got: ${PORT})"
+            echo "::error::port must be 1..65535"
             exit 1
           fi
-
           {
             echo "source_repo=${REPO}"
             echo "ref=${REF}"
             echo "hold_minutes=${HOLD}"
             echo "port=${PORT}"
+            echo "same_repo=0"
           } >> "${GITHUB_OUTPUT}"
-          # Secret-sourced owner/name is masked by Actions when it matches the secret value.
           echo "Resolved source=${REPO}@${REF} hold=${HOLD}m port=${PORT}"
 
-      - name: Checkout source into work/
+      - name: Checkout source repo
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.resolve.outputs.source_repo }}
           ref: ${{ steps.resolve.outputs.ref }}
           token: ${{ secrets.SOURCE_FETCH_TOKEN }}
-          path: work
-          # TINF-3101: pull third_party/bpftime (public) for SETUP-004 bootstrap.
           submodules: recursive
           fetch-depth: 1
 
-      - name: Resolve bpftime cache key
-        id: bpftime_key
-        working-directory: work
+      - name: Fail fast on required secrets
         shell: bash
         run: |
           set -euo pipefail
-          # Prefer the recorded submodule SHA; fall back to pinned ref string.
-          KEY=""
-          if [[ -f .gitmodules ]] && grep -Fq 'third_party/bpftime' .gitmodules; then
-            KEY="$(git rev-parse HEAD:third_party/bpftime 2>/dev/null || true)"
+          missing=0
+          if [[ -z "${CURSOR_API_KEY}" ]]; then
+            echo "::error::Secret CURSOR_API_KEY is required (Cursor Dashboard → API Keys, personal user key)"
+            missing=1
           fi
-          if [[ -z "${KEY}" ]]; then
-            KEY="${SYMBOTREE_BPFTIME_REF:-v0.2.0}"
+          if [[ -z "${MCP_BEARER_TOKEN}" ]]; then
+            echo "::error::Secret MCP_BEARER_TOKEN is required (daemon + Desktop remote MCP)"
+            missing=1
           fi
-          {
-            echo "key=${KEY}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "bpftime cache key=${KEY}"
+          if [[ -z "${SOURCE_FETCH_TOKEN}" ]]; then
+            echo "::error::Secret SOURCE_FETCH_TOKEN is required (checkout/fetch token for the source repo)"
+            missing=1
+          fi
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
 
-      - name: Install bpftime build deps (TINF-3101)
+      - name: Desktop packages (basic-test RDP + Cursor Linux computer-use)
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
+          sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            binutils-dev \
-            ca-certificates \
-            clang \
-            cmake \
-            g++ \
-            git \
-            libboost-all-dev \
-            libbpf-dev \
-            libclang-dev \
-            libelf-dev \
-            libssl-dev \
-            llvm \
-            llvm-dev \
-            ninja-build \
-            pkg-config \
-            zlib1g-dev
-          cmake --version
-          clang --version | head -n1
+            xfce4 xfce4-goodies xrdp dbus-x11 ufw net-tools curl wget unzip \
+            ffmpeg tigervnc-standalone-server x11-utils x11-xserver-utils xdotool
+          echo "xfce4-session" | sudo tee /etc/skel/.xsession
+          sudo adduser xrdp ssl-cert 2>/dev/null || true
+          sudo sed -i 's/^KillDisconnected=.*/KillDisconnected=false/' /etc/xrdp/sesman.ini \
+            || echo "KillDisconnected=false" | sudo tee -a /etc/xrdp/sesman.ini
+          sudo sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=0/' /etc/xrdp/sesman.ini \
+            || echo "DisconnectedTimeLimit=0" | sudo tee -a /etc/xrdp/sesman.ini
+          sudo sed -i 's/^IdleTimeLimit=.*/IdleTimeLimit=0/' /etc/xrdp/sesman.ini \
+            || echo "IdleTimeLimit=0" | sudo tee -a /etc/xrdp/sesman.ini
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
 
-      - name: Cache bpftime CLI/agent + cmake build tree
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.SYMBOTREE_BPFTIME_HOME }}
-            work/third_party/bpftime/build
-          key: n1-bpftime-${{ runner.os }}-${{ steps.bpftime_key.outputs.key }}
-          restore-keys: |
-            n1-bpftime-${{ runner.os }}-
-
-      - name: Bootstrap bpftime (SETUP-004 / TINF-3101)
-        working-directory: work
-        shell: bash
-        env:
-          SYMBOTREE_BPFTIME_STRICT: "1"
-          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
-          SYMBOTREE_BPFTIME_REF: ${{ env.SYMBOTREE_BPFTIME_REF }}
-        run: |
-          set -euo pipefail
-          if [[ ! -x scripts/bootstrap_bpftime.sh ]]; then
-            echo "::error::scripts/bootstrap_bpftime.sh missing in source checkout"
-            exit 1
-          fi
-          # Ensure submodule / clone exists even if checkout skipped nested bits.
-          if [[ -f .gitmodules ]] && grep -Fq 'third_party/bpftime' .gitmodules; then
-            git submodule update --init --depth 1 third_party/bpftime \
-              || git submodule update --init third_party/bpftime \
-              || true
-          fi
-          bash scripts/bootstrap_bpftime.sh
-          test -x "${SYMBOTREE_BPFTIME_HOME}/bpftime"
-          test -f "${SYMBOTREE_BPFTIME_HOME}/libbpftime-agent.so" \
-            || test -f "${SYMBOTREE_BPFTIME_HOME}/libbpftime-agent.dylib"
-          "${SYMBOTREE_BPFTIME_HOME}/bpftime" --help >/tmp/n1-bpftime-help.txt 2>&1 \
-            || "${SYMBOTREE_BPFTIME_HOME}/bpftime" -h >/tmp/n1-bpftime-help.txt 2>&1 \
-            || "${SYMBOTREE_BPFTIME_HOME}/bpftime" >/tmp/n1-bpftime-help.txt 2>&1 \
-            || true
-          if ! grep -Eiq 'attach|load|usage|bpftime' /tmp/n1-bpftime-help.txt; then
-            echo "::error::bpftime help missing attach/load after bootstrap"
-            cat /tmp/n1-bpftime-help.txt || true
-            exit 1
-          fi
-          echo "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_ENV}"
-          echo "bpftime ready at ${SYMBOTREE_BPFTIME_HOME}/bpftime"
-
-      - name: Discover workspace daemon package + bin
-        id: daemon
-        working-directory: work
+      - name: Create RDP user
         shell: bash
         run: |
           set -euo pipefail
-          # Prefer a workspace package whose name ends in -daemon, then its
-          # primary bin (src/main.rs). Never hardcode product package names.
-          cargo metadata --no-deps --format-version 1 > "${RUNNER_TEMP}/cargo-metadata.json"
-          mapfile -t DISCOVERED < <(
-            python3 - "${RUNNER_TEMP}/cargo-metadata.json" <<'PY'
-          import json, sys
-          meta = json.load(open(sys.argv[1], encoding="utf-8"))
-          members = set(meta["workspace_members"])
-          for pkg in meta["packages"]:
-              if pkg["id"] not in members:
-                  continue
-              if not pkg["name"].endswith("-daemon"):
-                  continue
-              bins = [t for t in pkg["targets"] if "bin" in t.get("kind", [])]
-              if not bins:
-                  continue
-              main = [
-                  t for t in bins
-                  if t.get("src_path", "").replace("\\", "/").endswith("/main.rs")
-              ]
-              chosen = (main or bins)[0]
-              print(pkg["name"])
-              print(chosen["name"])
-              break
-          else:
-              sys.stderr.write("no workspace package ending in -daemon with a bin target\n")
-              sys.exit(1)
-          PY
-          )
-          PKG="${DISCOVERED[0]}"
-          BIN="${DISCOVERED[1]}"
-          {
-            echo "package=${PKG}"
-            echo "bin=${BIN}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "Daemon package=${PKG} bin=${BIN}"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: work
-          shared-key: n1-daemon-release
-
-      - name: cargo build --release (daemon) + smoke --help
-        working-directory: work
-        shell: bash
-        run: |
-          set -euo pipefail
-          PKG="${{ steps.daemon.outputs.package }}"
-          BIN="${{ steps.daemon.outputs.bin }}"
-          cargo build --release -p "${PKG}" --bin "${BIN}"
-          "./target/release/${BIN}" --help >/dev/null
-          test -x "./target/release/${BIN}"
-
-      - name: MCP live probe attestation (TINF-3103)
-        id: livebpf
-        working-directory: work
-        shell: bash
-        env:
-          BIN: ${{ steps.daemon.outputs.bin }}
-          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
-          EVIDENCE_PATH: ${{ runner.temp }}/tinf-3103-tinf-evidence.json
-        run: |
-          set -euo pipefail
-          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
-          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
-          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
-          if [[ ! -x "${SYMBOTREE_BPFTIME_HOME}/bpftime" ]]; then
-            echo "::error::bpftime CLI missing — cannot attest live plane"
-            exit 1
-          fi
-          if ! command -v bpftime >/dev/null 2>&1; then
-            echo "::error::bpftime not on PATH for attestation"
-            exit 1
-          fi
-
-          DAEMON_BIN="$(pwd)/target/release/${BIN}"
-          ARTIFACT_DIR="${RUNNER_TEMP}/n1-livebpf"
-          mkdir -p "${ARTIFACT_DIR}"
-          TOKEN_FILE="${ARTIFACT_DIR}/attest.bearer"
-          PID_FILE="${ARTIFACT_DIR}/attest.pid"
-          LOG_FILE="${ARTIFACT_DIR}/attest.log"
-          EVIDENCE="${EVIDENCE_PATH}"
-          umask 077
-          # Ephemeral local-only token (not the Desktop bearer); never written to evidence.
-          ATTEST_TOKEN="$(openssl rand -hex 24)"
-          printf '%s' "${ATTEST_TOKEN}" > "${TOKEN_FILE}"
-          chmod 0600 "${TOKEN_FILE}"
-
-          LISTEN="127.0.0.1:18741"
-          BASE_URL="http://${LISTEN}"
-
-          cleanup() {
-            local exit_code=$?
-            if [[ -f "${PID_FILE}" ]]; then
-              local pid
-              pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
-              if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-                kill "${pid}" 2>/dev/null || true
-                wait "${pid}" 2>/dev/null || true
-              fi
-            fi
-            rm -f "${TOKEN_FILE}" "${PID_FILE}"
-            return "${exit_code}"
-          }
-          trap cleanup EXIT
-
-          env \
-            "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" \
-            "PATH=${PATH}" \
-            "${DAEMON_BIN}" \
-            --listen "${LISTEN}" \
-            --token-file "${TOKEN_FILE}" \
-            --allow-tools all \
-            >"${LOG_FILE}" 2>&1 &
-          echo $! > "${PID_FILE}"
-
-          ok=0
-          for i in $(seq 1 60); do
-            if curl -fsS --max-time 2 "${BASE_URL}/health" >/tmp/n1-attest-health.json 2>/dev/null; then
-              ok=1
-              break
-            fi
-            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
-              echo "::error::attest daemon exited; log:"
-              tail -n 200 "${LOG_FILE}" || true
-              exit 1
-            fi
-            sleep 1
-          done
-          if [[ "${ok}" -ne 1 ]]; then
-            echo "::error::attest /health never ready; log:"
-            tail -n 200 "${LOG_FILE}" || true
-            exit 1
-          fi
-
-          rpc_call() {
-            local method="$1"
-            local params="$2"
-            local out="$3"
-            curl -fsS --max-time 60 \
-              -H "Authorization: Bearer ${ATTEST_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
-              "${BASE_URL}/rpc" > "${out}"
-          }
-
-          rpc_call list_probe_targets \
-            '{"path":"samples/bpftime/victim.c","include_session":true}' \
-            /tmp/n1-attest-targets.json
-
-          make -C samples/bpftime victim >/tmp/n1-attest-victim-build.log 2>&1 || true
-          if [[ -x samples/bpftime/victim ]]; then
-            if ! rpc_call attach_bpftime_probes \
-              '{"binary":"samples/bpftime/victim","path":"samples/bpftime/victim.c"}' \
-              /tmp/n1-attest-attach.json; then
-              echo "::warning::attach_bpftime_probes RPC failed (rootless limits may apply)"
-              echo '{"ok":false,"note":"attach RPC failed"}' > /tmp/n1-attest-attach.json
-            fi
+          if [[ -z "${RDP_PASSWORD}" ]]; then
+            RDP_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)"
+            echo "RDP_PASSWORD_GENERATED=1" >> "${GITHUB_ENV}"
           else
-            echo '{"ok":false,"note":"victim binary missing"}' > /tmp/n1-attest-attach.json
+            echo "RDP_PASSWORD_GENERATED=0" >> "${GITHUB_ENV}"
           fi
+          if ! id rdp >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash rdp
+          fi
+          echo "rdp:${RDP_PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo rdp
+          echo "xfce4-session" | sudo tee /home/rdp/.xsession
+          sudo chown rdp:rdp /home/rdp/.xsession
+          install -d -o rdp -g rdp /home/rdp/.config/autostart
+          printf '%s\n' \
+            '[Desktop Entry]' \
+            'Type=Application' \
+            'Name=DisableLockScreen' \
+            'Exec=xfconf-query -c xfce4-screensaver -p /saver/enabled -s false' \
+            'X-GNOME-Autostart-enabled=true' \
+            | sudo tee /home/rdp/.config/autostart/disable-lock.desktop >/dev/null
+          sudo chown -R rdp:rdp /home/rdp/.config
+          {
+            echo "RDP_USER=rdp"
+            echo "RDP_PASSWORD=${RDP_PASSWORD}"
+          } >> "${GITHUB_ENV}"
 
-          rpc_call list_telemetry_events '{"drain":false}' /tmp/n1-attest-telemetry.json \
-            || echo '{"ok":false}' > /tmp/n1-attest-telemetry.json
+      - name: Build this ref (tinf compile path)
+        shell: bash
+        env:
+          SYMBOTREE_BOOTSTRAP_BPFTIME: ${{ inputs.bootstrap_bpftime && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [[ -x scripts/cursor_cloud_install.sh ]]; then
+            bash scripts/cursor_cloud_install.sh
+          else
+            bash scripts/ensure_symbotreed.sh
+          fi
+          test -x .symbotree/bin/symbotreed || test -x target/release/symbotreed
 
-          python3 - <<'PY'
-          import json, os, sys
-          from datetime import datetime, timezone
-
-          def load(path):
-              try:
-                  return json.load(open(path, encoding="utf-8"))
-              except Exception as exc:
-                  return {"_load_error": str(exc)}
-
-          def unwrap(rpc):
-              if not isinstance(rpc, dict):
-                  return {}
-              if "result" in rpc:
-                  return rpc["result"]
-              if "error" in rpc:
-                  return {"ok": False, "rpc_error": rpc["error"]}
-              return rpc
-
-          targets = unwrap(load("/tmp/n1-attest-targets.json"))
-          attach = unwrap(load("/tmp/n1-attest-attach.json"))
-          telem = unwrap(load("/tmp/n1-attest-telemetry.json"))
-
-          live = targets.get("live")
-          bpftime_available = targets.get("bpftime_available")
-          unavailable = targets.get("unavailable")
-          backend = targets.get("backend")
-          session = targets.get("session") or {}
-          if live is None:
-              live = session.get("live")
-          if bpftime_available is None:
-              bpftime_available = session.get("bpftime_available")
-          if unavailable is None and live is not None:
-              unavailable = not live
-          if backend is None:
-              backend = session.get("backend")
-
-          ok = (
-              targets.get("ok") is True
-              and bpftime_available is True
-              and live is True
-              and unavailable is False
-          )
-          evidence = {
-              "ticket": "TINF-3103",
-              "plane": "tinf",
-              "mcp_server": "symbotree-private-plane",
-              "ok": ok,
-              "attested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "attestation": {
-                  "mode": "pre_tailscale_localhost_mcp",
-                  "listen": "127.0.0.1:18741",
-                  "notes": [
-                      "Measured on tinf GHA runner after SETUP-004 bootstrap + daemon PATH wiring",
-                      "Localhost MCP attest before Tailscale hold (no Desktop tokens / TS IPs)",
-                      "Inverse of MCPOPS-3004 unavailable contract",
-                  ],
-              },
-              "tinf_measured": {
-                  "list_probe_targets": {
-                      "ok": targets.get("ok"),
-                      "live": live,
-                      "unavailable": unavailable,
-                      "bpftime_available": bpftime_available,
-                      "backend": backend,
-                      "detail": targets.get("detail"),
-                      "target_count": targets.get("target_count"),
-                      "session": {
-                          "bpftime_available": session.get("bpftime_available"),
-                          "backend": session.get("backend"),
-                          "attachment_count": session.get("attachment_count"),
-                          "ip_map_size": session.get("ip_map_size"),
-                          "live": session.get("live"),
-                          "unavailable": session.get("unavailable"),
-                      },
-                  },
-                  "attach_bpftime_probes": {
-                      "attempted": os.path.exists("samples/bpftime/victim"),
-                      "ok": attach.get("ok"),
-                      "live": attach.get("live"),
-                      "bpftime_available": attach.get("bpftime_available"),
-                      "backend": attach.get("backend"),
-                      "note": attach.get("note"),
-                  },
-                  "list_telemetry_events": {
-                      "ok": telem.get("ok"),
-                      "live": telem.get("live"),
-                      "bpftime_available": telem.get("bpftime_available"),
-                      "drained": telem.get("drained"),
-                  },
-              },
-              "contract": {
-                  "when_bpftime_available_true": {
-                      "live": True,
-                      "unavailable": False,
-                      "bpftime_available": True,
-                      "detail_contains": "live",
-                  },
-                  "source": [
-                      "docs/project-files/09-tinf/n1.yml",
-                      "crates/symbotree-daemon/src/platform.rs",
-                      "crates/symbotree-instrument/src/session.rs",
-                  ],
-              },
-          }
-          out = os.environ["EVIDENCE_PATH"]
-          json.dump(evidence, open(out, "w", encoding="utf-8"), indent=2)
-          print(json.dumps({
-              "ok": ok,
-              "live": live,
-              "bpftime_available": bpftime_available,
-              "backend": backend,
-              "attach_ok": attach.get("ok"),
-          }))
-          if not ok:
-              print("LIVE ATTEST FAILED", file=sys.stderr)
-              print(json.dumps(targets, indent=2)[:4000], file=sys.stderr)
-              sys.exit(1)
-          PY
-
-          echo "evidence=${EVIDENCE}" >> "${GITHUB_OUTPUT}"
-          echo "TINF-3103 live attestation ok; evidence=${EVIDENCE}"
-
-      - name: Upload TINF-3103 evidence artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tinf-3103-tinf-evidence
-          path: ${{ runner.temp }}/tinf-3103-tinf-evidence.json
-          if-no-files-found: error
+      - name: Install Cursor CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl https://cursor.com/install -fsS | bash
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          echo "${HOME}/.cursor/bin" >> "${GITHUB_PATH}"
+          export PATH="${HOME}/.local/bin:${HOME}/.cursor/bin:${PATH}"
+          agent --version || cursor-agent --version
 
       - name: Install Tailscale
         shell: bash
@@ -534,272 +223,216 @@ jobs:
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sudo sh
           sudo mkdir -p /var/run/tailscale /var/lib/tailscale /dev/net
-          # Inbound listen on the Tailscale IPv4 needs a real TUN device.
-          # GitHub-hosted runners usually allow creating /dev/net/tun.
           if [[ ! -c /dev/net/tun ]]; then
             sudo mknod /dev/net/tun c 10 200
             sudo chmod 666 /dev/net/tun
           fi
           if [[ ! -c /dev/net/tun ]]; then
-            echo "::error::/dev/net/tun unavailable; cannot publish an inbound MCP listener on Tailscale IPv4"
+            echo "::error::/dev/net/tun unavailable; cannot publish inbound Tailscale listeners"
             exit 1
           fi
           sudo tailscaled \
             --state=/var/lib/tailscale/tailscaled.state \
             --socket=/var/run/tailscale/tailscaled.sock \
             >/tmp/tailscaled.log 2>&1 &
-          echo $! | sudo tee /tmp/tailscaled.pid >/dev/null
           for i in $(seq 1 30); do
             if sudo tailscale --socket=/var/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
-          echo "tailscaled started; log=/tmp/tailscaled.log"
 
-      - name: Tailscale up (manual login — watch the auth URL in the log)
+      - name: Tailscale up
         shell: bash
         run: |
           set -euo pipefail
-          HOSTNAME="symbotree-live"
-          echo "================================================================"
-          echo "Manual Tailscale login required."
-          echo "When the auth URL appears below, open it in a browser and approve."
-          echo "This step blocks until login completes (or the job times out)."
-          echo "================================================================"
-          # --timeout 0 waits indefinitely for interactive auth (job still
-          # bounded by timeout-minutes: 360).
-          sudo tailscale --socket=/var/run/tailscale/tailscaled.sock up \
-            --hostname="${HOSTNAME}" \
-            --accept-dns=false \
-            --ssh \
-            --timeout=0
-          TS_IP="$(sudo tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 | head -n1)"
+          HOSTNAME="gha-cursor-env-${GITHUB_RUN_ID}"
+          SOCK=(--socket=/var/run/tailscale/tailscaled.sock)
+          if [[ -n "${TAILSCALE_AUTH_KEY}" ]]; then
+            sudo tailscale "${SOCK[@]}" up \
+              --authkey="${TAILSCALE_AUTH_KEY}" \
+              --hostname="${HOSTNAME}" \
+              --accept-dns=false
+          else
+            echo "================================================================"
+            echo "No TAILSCALE_AUTH_KEY. Open the auth URL below and approve."
+            echo "================================================================"
+            sudo tailscale "${SOCK[@]}" up \
+              --hostname="${HOSTNAME}" \
+              --accept-dns=false \
+              --ssh \
+              --timeout=0
+          fi
+          TS_IP="$(sudo tailscale "${SOCK[@]}" ip -4 | head -n1)"
           if [[ -z "${TS_IP}" ]]; then
-            echo "::error::Tailscale IPv4 missing after successful up"
+            echo "::error::Tailscale IPv4 missing"
             exit 1
           fi
           echo "TS_IP=${TS_IP}" >> "${GITHUB_ENV}"
           echo "Tailscale IPv4=${TS_IP}"
 
-      - name: Wire bpftime PATH + boot smoke (TINF-3102)
-        working-directory: work
-        shell: bash
-        env:
-          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
-        run: |
-          set -euo pipefail
-          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
-          if [[ ! -x "${HOME_BPFTIME}/bpftime" ]]; then
-            echo "::error::bpftime CLI missing at ${HOME_BPFTIME}/bpftime (TINF-3101 bootstrap required)"
-            exit 1
-          fi
-          if [[ ! -f "${HOME_BPFTIME}/libbpftime-agent.so" \
-             && ! -f "${HOME_BPFTIME}/libbpftime-agent.dylib" ]]; then
-            echo "::error::libbpftime-agent missing under ${HOME_BPFTIME}"
-            exit 1
-          fi
-
-          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
-          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
-
-          # Persist for subsequent steps (daemon must inherit locate_bpftime).
-          # Prefer GITHUB_PATH for PATH prepend (do not write PATH= into GITHUB_ENV).
-          echo "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_ENV}"
-          echo "${SYMBOTREE_BPFTIME_HOME}" >> "${GITHUB_PATH}"
-
-          if ! command -v bpftime >/dev/null 2>&1; then
-            echo "::error::bpftime not on PATH after prepending ${SYMBOTREE_BPFTIME_HOME}"
-            exit 1
-          fi
-          BPFTIME_BIN="$(command -v bpftime)"
-          echo "bpftime on PATH: ${BPFTIME_BIN}"
-
-          "${BPFTIME_BIN}" --help >/tmp/n1-bpftime-boot-help.txt 2>&1 \
-            || "${BPFTIME_BIN}" -h >/tmp/n1-bpftime-boot-help.txt 2>&1 \
-            || "${BPFTIME_BIN}" >/tmp/n1-bpftime-boot-help.txt 2>&1 \
-            || true
-          if ! grep -Eiq 'attach|load|usage|bpftime' /tmp/n1-bpftime-boot-help.txt; then
-            echo "::error::bpftime --help boot smoke failed (attach/load missing)"
-            cat /tmp/n1-bpftime-boot-help.txt || true
-            exit 1
-          fi
-          echo "bpftime --help boot smoke ok"
-
-          # Optional SETUP-004 verify (CLI required; live attach best-effort).
-          if [[ -x scripts/verify_bpftime_env.sh ]]; then
-            # Non-strict: do not fail the session on rootless attach limits.
-            SYMBOTREE_BPFTIME_STRICT=0 bash scripts/verify_bpftime_env.sh \
-              || echo "::warning::verify_bpftime_env.sh reported issues (non-fatal)"
-          fi
-
-      - name: Start daemon on Tailscale IP + health/tools assert
-        id: mcp
-        working-directory: work
-        shell: bash
+      - name: Firewall (Tailscale only)
         env:
           PORT: ${{ steps.resolve.outputs.port }}
-          HOLD_MINUTES: ${{ steps.resolve.outputs.hold_minutes }}
-          BIN: ${{ steps.daemon.outputs.bin }}
-          SYMBOTREE_BPFTIME_HOME: ${{ env.SYMBOTREE_BPFTIME_HOME }}
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${TS_IP:-}" ]]; then
-            echo "::error::TS_IP not set"
+          sudo ufw default deny incoming
+          sudo ufw allow in on tailscale0 to any port 3389 proto tcp
+          sudo ufw allow in on tailscale0 to any port "${PORT}" proto tcp
+          sudo ufw --force enable
+          nc -zv -w 5 "${TS_IP}" 3389 || echo "::warning::RDP 3389 not reachable yet (session starts on first connect)"
+
+      - name: Start symbotreed (UDS + Tailscale TCP)
+        id: mcp
+        env:
+          PORT: ${{ steps.resolve.outputs.port }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAEMON=""
+          for c in .symbotree/bin/symbotreed target/release/symbotreed; do
+            if [[ -x "${c}" ]]; then DAEMON="$(pwd)/${c}"; break; fi
+          done
+          if [[ -z "${DAEMON}" ]]; then
+            echo "::error::symbotreed binary missing"
             exit 1
           fi
-
-          # TINF-3102: daemon child must see bpftime for ProbeManager.live=true.
-          HOME_BPFTIME="${SYMBOTREE_BPFTIME_HOME:-${HOME}/.bpftime}"
-          export SYMBOTREE_BPFTIME_HOME="${HOME_BPFTIME}"
-          export PATH="${SYMBOTREE_BPFTIME_HOME}:${PATH}"
-          if ! command -v bpftime >/dev/null 2>&1; then
-            echo "::error::bpftime not on PATH at daemon start"
-            exit 1
-          fi
-
-          ARTIFACT_DIR="${RUNNER_TEMP}/n1-session"
-          mkdir -p "${ARTIFACT_DIR}"
+          ARTIFACT_DIR="${RUNNER_TEMP}/cursor-env"
+          mkdir -p "${ARTIFACT_DIR}" .symbotree
           TOKEN_FILE="${ARTIFACT_DIR}/mcp.bearer"
-          PID_FILE="${ARTIFACT_DIR}/daemon.pid"
-          LOG_FILE="${ARTIFACT_DIR}/daemon.log"
           umask 077
           printf '%s' "${MCP_BEARER_TOKEN}" > "${TOKEN_FILE}"
           chmod 0600 "${TOKEN_FILE}"
-
-          DAEMON_BIN="$(pwd)/target/release/${BIN}"
-          LISTEN="${TS_IP}:${PORT}"
-          BASE_URL="http://${LISTEN}"
-
-          cleanup() {
-            local exit_code=$?
-            if [[ -f "${PID_FILE}" ]]; then
-              local pid
-              pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
-              if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-                kill "${pid}" 2>/dev/null || true
-                wait "${pid}" 2>/dev/null || true
-              fi
-            fi
-            rm -f "${TOKEN_FILE}" "${PID_FILE}"
-            return "${exit_code}"
-          }
-          trap cleanup EXIT
-
-          # CLOUD-1609 Option B: same session id on daemon + Cursor stdio bridge
-          # (`scripts/cursor_remote_mcp.py`). Bare HTTP MCP has no staging path —
-          # Desktop/Cloud Agents must use the bridge when this env is set, or
-          # PathResolver will miss unstaged agent bytes (no OS fallthrough).
-          WS_SESSION="n1-${GITHUB_RUN_ID}"
+          WS_SESSION="gha-${GITHUB_RUN_ID}"
           echo "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" >> "${GITHUB_ENV}"
-          echo "workspace_session=${WS_SESSION}" >> "${GITHUB_OUTPUT}"
-
-          # Private-plane full catalog (Tailscale + bearer). Public Cloud Run
-          # edge stays autonomy-edge — never use "all" there.
-          # Env (PATH + SYMBOTREE_BPFTIME_HOME + WORKSPACE_SESSION) inherited.
+          LISTEN="${TS_IP}:${PORT}"
+          LOG="${ARTIFACT_DIR}/daemon.log"
           env \
-            "SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME}" \
+            "SYMBOTREE_FS_IDENTITY=local" \
             "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" \
-            "PATH=${PATH}" \
-            "${DAEMON_BIN}" \
+            "SYMBOTREE_AGENT_WORKSPACE=$(pwd)" \
+            "${DAEMON}" \
+            --socket "$(pwd)/.symbotree/mcp.sock" \
             --listen "${LISTEN}" \
             --token-file "${TOKEN_FILE}" \
             --allow-tools all \
-            >"${LOG_FILE}" 2>&1 &
-          echo $! > "${PID_FILE}"
-
-          # Health-check loop
+            >"${LOG}" 2>&1 &
+          echo $! > "${ARTIFACT_DIR}/daemon.pid"
+          BASE_URL="http://${LISTEN}"
           ok=0
           for i in $(seq 1 60); do
-            if curl -fsS --max-time 2 "${BASE_URL}/health" >/tmp/n1-health.json 2>/dev/null; then
+            if curl -fsS --max-time 2 "${BASE_URL}/health" >/dev/null; then
               ok=1
               break
-            fi
-            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
-              echo "::error::daemon exited during boot; log:"
-              tail -n 200 "${LOG_FILE}" || true
-              exit 1
             fi
             sleep 1
           done
           if [[ "${ok}" -ne 1 ]]; then
-            echo "::error::/health never became ready; log:"
-            tail -n 200 "${LOG_FILE}" || true
+            echo "::error::/health never ready"
+            tail -n 200 "${LOG}" || true
             exit 1
           fi
-          echo "health ok: $(cat /tmp/n1-health.json)"
-          echo "bpftime_env daemon SYMBOTREE_BPFTIME_HOME=${SYMBOTREE_BPFTIME_HOME} bpftime=$(command -v bpftime)"
-
-          # Authenticated tools list — full catalog under --allow-tools all.
-          TOOLS_JSON="$(curl -fsS --max-time 10 \
-            -H "Authorization: Bearer ${MCP_BEARER_TOKEN}" \
-            "${BASE_URL}/mcp/tools")"
-          printf '%s\n' "${TOOLS_JSON}" > /tmp/n1-tools.json
-          python3 - <<'PY'
-          import json, sys
-          data = json.loads(open("/tmp/n1-tools.json", encoding="utf-8").read())
-          tools = data.get("tools") or data.get("result", {}).get("tools") or []
-          names = {t.get("name") for t in tools if isinstance(t, dict)}
-          if not names:
-              print("tools/list empty", file=sys.stderr)
-              sys.exit(1)
-          # Full private-plane catalog markers (read + mutators).
-          required = {
-              "query_ast_node",
-              "run_sast_scan",
-              "pack_context",
-              "execute_ast_surgery",
-              "attach_bpftime_probes",
-              "run_closed_loop",
-          }
-          missing = sorted(required - names)
-          if missing:
-              print(f"missing expected tools: {missing}; have={sorted(names)}", file=sys.stderr)
-              sys.exit(1)
-          print(f"tools ok count={len(names)} sample={sorted(names)[:12]}")
-          PY
-
-          {
-            echo "base_url=${BASE_URL}"
-            echo "token_file=${TOKEN_FILE}"
-            echo "pid_file=${PID_FILE}"
-            echo "log_file=${LOG_FILE}"
-            echo "artifact_dir=${ARTIFACT_DIR}"
-          } >> "${GITHUB_OUTPUT}"
-
-          echo "================================================================"
-          echo "MCP base URL (use stdio bridge — CLOUD-1609 session ON): ${BASE_URL}"
-          echo "Auth: Authorization: Bearer <MCP_BEARER_TOKEN secret value>"
-          echo "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}"
-          echo "Health: ${BASE_URL}/health"
-          echo "Tools:  ${BASE_URL}/mcp/tools"
-          echo "Hold:   ${HOLD_MINUTES} minute(s)"
-          echo "----------------------------------------------------------------"
-          echo "Cursor mcp.json (stdio bridge — required for session staging):"
-          echo "  export SYMBOTREE_PRIVATE_PLANE_URL=${BASE_URL}"
-          echo "  export SYMBOTREE_RPC_TOKEN=<MCP_BEARER_TOKEN>"
-          echo "  export SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}"
-          echo "  # then use .cursor/mcp.json → symbotree-private-plane"
-          echo "Bare HTTP MCP URL config will NOT stage /workspace bytes."
-          echo "================================================================"
           echo "MCP_BASE_URL=${BASE_URL}" >> "${GITHUB_ENV}"
+          echo "DAEMON_PID_FILE=${ARTIFACT_DIR}/daemon.pid" >> "${GITHUB_ENV}"
+          echo "DAEMON_LOG=${LOG}" >> "${GITHUB_ENV}"
+          echo "base_url=${BASE_URL}" >> "${GITHUB_OUTPUT}"
+          echo "health ok ${BASE_URL}"
 
-          # Hold with periodic /health until minutes elapse; trap always cleans up.
-          END_AT=$((SECONDS + HOLD_MINUTES * 60))
-          echo "Holding until epoch-offset ${END_AT} (hold_minutes=${HOLD_MINUTES})"
+      - name: Start Cursor worker (My Machines — no Cursor VM)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.local/bin:${HOME}/.cursor/bin:${PATH}"
+          export CURSOR_API_KEY
+          nohup agent worker \
+            --computer-use \
+            --share-desktop \
+            --name gha-cursor-env \
+            --worker-dir "$(pwd)" \
+            --api-key "${CURSOR_API_KEY}" \
+            start \
+            >/tmp/cursor-worker.log 2>&1 &
+          echo $! > /tmp/cursor-worker.pid
+          sleep 8
+          if ! kill -0 "$(cat /tmp/cursor-worker.pid)" 2>/dev/null; then
+            echo "::error::Cursor worker exited; log:"
+            tail -n 200 /tmp/cursor-worker.log || true
+            exit 1
+          fi
+          echo "WORKER_PID_FILE=/tmp/cursor-worker.pid" >> "${GITHUB_ENV}"
+          echo "Cursor worker started as name=gha-cursor-env"
+
+      - name: Publish how to connect
+        env:
+          HOLD: ${{ steps.resolve.outputs.hold_minutes }}
+          REF: ${{ steps.resolve.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## cursor-env session ready"
+            echo ""
+            echo "This is a GitHub-hosted runner, **not** a Cursor Cloud VM."
+            echo ""
+            echo "| Thing | Value |"
+            echo "| --- | --- |"
+            echo "| ref | \`${REF}\` |"
+            echo "| Tailscale IPv4 | \`${TS_IP}\` |"
+            echo "| MCP | \`${MCP_BASE_URL}\` |"
+            echo "| session | \`${SYMBOTREE_WORKSPACE_SESSION}\` |"
+            echo "| RDP | \`${TS_IP}:3389\` user \`rdp\` |"
+            echo "| Cursor worker name | \`gha-cursor-env\` |"
+            echo "| hold | ${HOLD} minutes |"
+            echo ""
+            echo "### Cursor web (no VM credits)"
+            echo "1. Open https://cursor.com/agents"
+            echo "2. Pick machine **gha-cursor-env** (My Machines / self-hosted)"
+            echo "3. Send a task. Use **Take control** / desktop share on that worker."
+            echo "4. Slack/GitHub: \`worker=gha-cursor-env\`"
+            echo ""
+            echo "### Laptop Cursor MCP (stdio bridge, not bare HTTP)"
+            echo '```'
+            echo "export SYMBOTREE_PRIVATE_PLANE_URL=${MCP_BASE_URL}"
+            echo "export SYMBOTREE_RPC_TOKEN=<MCP_BEARER_TOKEN>"
+            echo "export SYMBOTREE_WORKSPACE_SESSION=${SYMBOTREE_WORKSPACE_SESSION}"
+            echo "# .cursor/mcp.json → symbotree-private-plane"
+            echo '```'
+            echo ""
+            echo "### RDP (basic-test path, Tailscale only)"
+            echo "Address \`${TS_IP}\` port 3389 user \`rdp\`."
+            if [[ "${RDP_PASSWORD_GENERATED}" == "1" ]]; then
+              echo "Ephemeral password for this job only: \`${RDP_PASSWORD}\`"
+            else
+              echo "Password is the \`RDP_PASSWORD\` Actions secret."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Hold until cancelled or timeout
+        env:
+          HOLD: ${{ steps.resolve.outputs.hold_minutes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          END_AT=$((SECONDS + HOLD * 60))
+          echo "Holding until ${END_AT} (hold_minutes=${HOLD})"
           while (( SECONDS < END_AT )); do
-            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
-              echo "::error::daemon died during hold; log:"
-              tail -n 200 "${LOG_FILE}" || true
+            if [[ -n "${DAEMON_PID_FILE:-}" ]] && ! kill -0 "$(cat "${DAEMON_PID_FILE}")" 2>/dev/null; then
+              echo "::error::daemon died"
+              tail -n 200 "${DAEMON_LOG:-/dev/null}" || true
               exit 1
             fi
-            if ! curl -fsS --max-time 5 "${BASE_URL}/health" >/dev/null; then
-              echo "::warning::periodic /health failed at SECONDS=${SECONDS}"
-            else
-              remaining=$(( END_AT - SECONDS ))
-              echo "health ok; ~${remaining}s remaining"
+            if [[ -n "${WORKER_PID_FILE:-}" ]] && ! kill -0 "$(cat "${WORKER_PID_FILE}")" 2>/dev/null; then
+              echo "::error::Cursor worker died"
+              tail -n 200 /tmp/cursor-worker.log || true
+              exit 1
             fi
-            # Sleep in chunks so job cancellation / trap still runs promptly.
+            if [[ -n "${MCP_BASE_URL:-}" ]]; then
+              curl -fsS --max-time 5 "${MCP_BASE_URL}/health" >/dev/null \
+                || echo "::warning::periodic /health failed"
+            fi
+            remaining=$(( END_AT - SECONDS ))
+            echo "[$(date -u +%H:%M:%SZ)] health ok; ~${remaining}s remaining"
             sleep 30
           done
-          echo "Hold complete; cleaning up daemon + token file"
+          echo "Hold complete"
