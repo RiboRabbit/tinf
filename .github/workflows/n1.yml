@@ -308,23 +308,76 @@ jobs:
           echo "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" >> "${GITHUB_ENV}"
           LISTEN="${TS_IP}:${PORT}"
           LOG="${ARTIFACT_DIR}/daemon.log"
-          env \
-            "SYMBOTREE_FS_IDENTITY=local" \
-            "SYMBOTREE_WORKSPACE_SESSION=${WS_SESSION}" \
-            "SYMBOTREE_AGENT_WORKSPACE=$(pwd)" \
+          PID_FILE="${ARTIFACT_DIR}/daemon.pid"
+          EXIT_LOG="${ARTIFACT_DIR}/daemon.exits"
+          SOCK="$(pwd)/.symbotree/mcp.sock"
+          # Supervise in a new session so GHA step teardown (SIGHUP/SIGTERM
+          # to the start-step process group) cannot reap the plane. Restart
+          # on unexpected exit — failed runs died with an empty log after
+          # ~13–27m of healthy hold (no panic; PID vanished).
+          cat > "${ARTIFACT_DIR}/supervise-daemon.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set +e
+          DAEMON="$1"
+          LOG="$2"
+          EXITS="$3"
+          SOCK="$4"
+          LISTEN="$5"
+          TOKEN="$6"
+          PIDFILE="$7"
+          echo $$ > "${PIDFILE}"
+          while true; do
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting ${DAEMON}" >>"${LOG}"
             "${DAEMON}" \
-            --socket "$(pwd)/.symbotree/mcp.sock" \
-            --listen "${LISTEN}" \
-            --token-file "${TOKEN_FILE}" \
-            --allow-tools all \
-            >"${LOG}" 2>&1 &
-          echo $! > "${ARTIFACT_DIR}/daemon.pid"
+              --socket "${SOCK}" \
+              --listen "${LISTEN}" \
+              --token-file "${TOKEN}" \
+              --allow-tools all \
+              >>"${LOG}" 2>&1
+            code=$?
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] daemon exited code=${code}; restarting in 2s" >>"${LOG}"
+            echo "${code} $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"${EXITS}"
+            sleep 2
+          done
+          EOS
+          # The heredoc above is indented with the step; strip that for bash.
+          sed -i 's/^          //' "${ARTIFACT_DIR}/supervise-daemon.sh"
+          chmod +x "${ARTIFACT_DIR}/supervise-daemon.sh"
+          : > "${LOG}"
+          : > "${EXIT_LOG}"
+          setsid env \
+            RUST_LOG="${RUST_LOG:-info}" \
+            RUST_BACKTRACE="${RUST_BACKTRACE:-1}" \
+            SYMBOTREE_FS_IDENTITY=local \
+            SYMBOTREE_WORKSPACE_SESSION="${WS_SESSION}" \
+            SYMBOTREE_AGENT_WORKSPACE="$(pwd)" \
+            "${ARTIFACT_DIR}/supervise-daemon.sh" \
+            "${DAEMON}" "${LOG}" "${EXIT_LOG}" \
+            "${SOCK}" "${LISTEN}" "${TOKEN_FILE}" "${PID_FILE}" \
+            </dev/null >/dev/null 2>&1 &
+          disown || true
+          for i in $(seq 1 50); do
+            if [[ -s "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if [[ ! -s "${PID_FILE}" ]] || ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            echo "::error::daemon supervisor failed to start"
+            tail -n 200 "${LOG}" || true
+            exit 1
+          fi
           BASE_URL="http://${LISTEN}"
           ok=0
           for i in $(seq 1 60); do
             if curl -fsS --max-time 2 "${BASE_URL}/health" >/dev/null; then
               ok=1
               break
+            fi
+            if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+              echo "::error::daemon supervisor died during boot; log:"
+              tail -n 200 "${LOG}" || true
+              exit 1
             fi
             sleep 1
           done
@@ -334,8 +387,9 @@ jobs:
             exit 1
           fi
           echo "MCP_BASE_URL=${BASE_URL}" >> "${GITHUB_ENV}"
-          echo "DAEMON_PID_FILE=${ARTIFACT_DIR}/daemon.pid" >> "${GITHUB_ENV}"
+          echo "DAEMON_PID_FILE=${PID_FILE}" >> "${GITHUB_ENV}"
           echo "DAEMON_LOG=${LOG}" >> "${GITHUB_ENV}"
+          echo "DAEMON_EXIT_LOG=${EXIT_LOG}" >> "${GITHUB_ENV}"
           echo "base_url=${BASE_URL}" >> "${GITHUB_OUTPUT}"
           echo "health ok ${BASE_URL}"
 
@@ -414,25 +468,56 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          dump_fail() {
+            echo "::error::$1"
+            echo "--- daemon.log ---"
+            tail -n 200 "${DAEMON_LOG:-/dev/null}" || true
+            echo "--- daemon exits ---"
+            cat "${DAEMON_EXIT_LOG:-/dev/null}" || true
+            echo "--- worker.log ---"
+            tail -n 100 /tmp/cursor-worker.log || true
+            echo "--- memory ---"
+            free -h || true
+            echo "--- dmesg (oom/kill) ---"
+            (dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true) | tail -n 80
+          }
           END_AT=$((SECONDS + HOLD * 60))
           echo "Holding until ${END_AT} (hold_minutes=${HOLD})"
+          health_fail=0
           while (( SECONDS < END_AT )); do
             if [[ -n "${DAEMON_PID_FILE:-}" ]] && ! kill -0 "$(cat "${DAEMON_PID_FILE}")" 2>/dev/null; then
-              echo "::error::daemon died"
-              tail -n 200 "${DAEMON_LOG:-/dev/null}" || true
+              dump_fail "daemon supervisor died"
               exit 1
             fi
             if [[ -n "${WORKER_PID_FILE:-}" ]] && ! kill -0 "$(cat "${WORKER_PID_FILE}")" 2>/dev/null; then
-              echo "::error::Cursor worker died"
-              tail -n 200 /tmp/cursor-worker.log || true
+              dump_fail "Cursor worker died"
               exit 1
             fi
             if [[ -n "${MCP_BASE_URL:-}" ]]; then
-              curl -fsS --max-time 5 "${MCP_BASE_URL}/health" >/dev/null \
-                || echo "::warning::periodic /health failed"
+              if curl -fsS --max-time 5 "${MCP_BASE_URL}/health" >/dev/null; then
+                health_fail=0
+              else
+                health_fail=$((health_fail + 1))
+                echo "::warning::periodic /health failed (${health_fail}/3)"
+                if [[ "${health_fail}" -ge 3 ]]; then
+                  dump_fail "MCP /health failed 3 consecutive checks"
+                  exit 1
+                fi
+              fi
             fi
             remaining=$(( END_AT - SECONDS ))
-            echo "[$(date -u +%H:%M:%SZ)] health ok; ~${remaining}s remaining"
+            echo "[$(date -u +%H:%M:%SZ)] hold ok; ~${remaining}s remaining health_fail=${health_fail}"
             sleep 30
           done
           echo "Hold complete"
+
+      - name: Upload cursor-env logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cursor-env-logs
+          path: |
+            ${{ runner.temp }}/cursor-env/daemon.log
+            ${{ runner.temp }}/cursor-env/daemon.exits
+            /tmp/cursor-worker.log
+          if-no-files-found: ignore
